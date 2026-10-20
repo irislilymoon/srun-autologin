@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 深澜 (Srun) 校园网认证客户端 —— 无浏览器自动登录。
 
 协议还原自 portal (http://10.0.0.55) 自身的 static/js/jquery.srun.portal.js
@@ -11,12 +11,15 @@
   2. 本地计算 hmd5 / info / chksum
   3. GET  /cgi-bin/srun_portal?action=login&...  -> 完成认证
 
-用法：
-  python srun_login.py params <username> <password> <challenge> <ip> <ac_id>
+用法（在项目根目录执行）：
+  python src\srun_login.py params <username> <password> <challenge> <ip> <ac_id>
       # 只打印参数（用于与门户 JS 对拍，不联网登录）
-  python srun_login.py login            # 认证一次
-  python srun_login.py check            # 只检查当前是否已在线
-  python srun_login.py watch            # 常驻守护：断了自动重连
+  python src\srun_login.py login            # 认证一次
+  python src\srun_login.py check            # 只检查当前是否已在线
+  python src\srun_login.py watch            # 独立常驻守护：断了自动重连
+  python src\srun_login.py config           # 配置菜单（= 深澜配置.bat）
+  python src\srun_login.py lab              # 测试台（= 深澜测试.bat）
+  python src\srun_login.py service          # 服务管理（= 深澜服务管理.bat）
 """
 
 from __future__ import annotations
@@ -32,7 +35,9 @@ import time as _probe_time
 
 def _early_probe() -> None:
     try:
-        base = _probe_os.path.dirname(_probe_os.path.abspath(__file__))
+        # 本文件在 src/ 子目录，日志统一放项目根的 logs/
+        base = _probe_os.path.dirname(
+            _probe_os.path.dirname(_probe_os.path.abspath(__file__)))
         path = _probe_os.path.join(base, "logs", "entry.log")
         _probe_os.makedirs(_probe_os.path.dirname(path), exist_ok=True)
         if _probe_os.path.exists(path) and _probe_os.path.getsize(path) > 32768:
@@ -69,6 +74,10 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 # 配置
 # --------------------------------------------------------------------------
+# 本文件在 src/ 子目录；config.json 与 logs/ 统一放在项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOG_DIR = PROJECT_ROOT / "logs"
+
 PORTAL = "http://10.0.0.55"
 PORTAL_HOST = "10.0.0.55"
 AC_ID = "43"
@@ -76,6 +85,10 @@ TASK_NAME = "SRun.AutoLogin"
 USERNAME = "STUDENT_ID"           # 学号 / 上网账号（默认占位符，真实值放 config.json）
 PASSWORD = "PUT_YOUR_PASSWORD"   # 密码（建议改到 config.json 里，别写死在脚本里）
 PLACEHOLDER = "PUT_YOUR_PASSWORD"
+
+# 登录模式：wired=仅有线（默认） / wifi=仅无线 / both=有线无线都登录
+LOGIN_MODES = ("wired", "wifi", "both")
+LOGIN_MODE_LABELS = {"wired": "仅有线", "wifi": "仅无线", "both": "有线+无线"}
 
 
 class ConfigError(RuntimeError):
@@ -362,7 +375,7 @@ def logout(username: str | None = None, ac_id: str | None = None, ip: str | None
 
 
 def config_path() -> Path:
-    return Path(__file__).with_name("config.json")
+    return PROJECT_ROOT / "config.json"
 
 
 def _read_config() -> dict:
@@ -386,13 +399,37 @@ def load_config() -> tuple[str, str, str]:
     )
 
 
-def write_config(username: str, password: str, ac_id: str, portal: str | None = None) -> Path:
-    data = {"username": username, "password": password, "ac_id": ac_id}
+def write_config(username: str | None = None, password: str | None = None,
+                 ac_id: str | None = None, portal: str | None = None,
+                 login_mode: str | None = None, reconnect: bool | None = None) -> Path:
+    """合并式写入：只更新给出的字段，其余字段保持 config.json 原值。"""
+    data = dict(_read_config())
+    if username is not None:
+        data["username"] = username
+    if password is not None:
+        data["password"] = password
+    if ac_id is not None:
+        data["ac_id"] = ac_id
     if portal:
         data["portal"] = portal
+    if login_mode in LOGIN_MODES:
+        data["login_mode"] = login_mode
+    if reconnect is not None:
+        data["reconnect"] = bool(reconnect)
     cfg = config_path()
     cfg.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return cfg
+
+
+def get_login_mode() -> str:
+    """读 config.json 的 login_mode：wired / wifi / both，默认 wired。"""
+    mode = str(_read_config().get("login_mode") or "wired").strip().lower()
+    return mode if mode in LOGIN_MODES else "wired"
+
+
+def get_reconnect() -> bool:
+    """读 config.json 的 reconnect：断线自动重连开关，默认 False（跑完即退出）。"""
+    return bool(_read_config().get("reconnect", False))
 
 
 def apply_config_constants() -> None:
@@ -739,15 +776,21 @@ def check_environment() -> dict:
     env["adapter"] = info
     kind = classify_adapter(info) if info.get("found") else "unknown"
     env["kind"] = kind
+    env["login_mode"] = mode = get_login_mode()
 
-    if kind == "wireless":
-        env["reason"] = "出口是无线网卡（%s），无线已预配好，跳过" % _first_line(info.get("name", ""))
-        return env
     if kind == "virtual":
         env["reason"] = "出口是虚拟网卡（%s），跳过" % _first_line(info.get("description", ""))
         return env
     if kind == "unknown":
         env["reason"] = "无法识别出口网卡类型 %s，跳过" % ip
+        return env
+    if kind == "wireless" and mode == "wired":
+        env["reason"] = "出口是无线网卡（%s），当前登录模式为「仅有线」，跳过" % _first_line(
+            info.get("name", ""))
+        return env
+    if kind == "wired" and mode == "wifi":
+        env["reason"] = "出口是有线网卡（%s），当前登录模式为「仅无线」，跳过" % _first_line(
+            info.get("name", ""))
         return env
 
     # 3) 确认对端真的是深澜门户
@@ -765,12 +808,13 @@ def check_environment() -> dict:
         env.update(online=True, reason="已联网，无需登录")
         return env
 
-    env.update(action="login", reason="有线 + 校园网 + 未认证，执行登录")
+    env.update(action="login", reason="%s + 校园网 + 未认证，执行登录" % (
+        "有线" if kind == "wired" else "无线"))
     return env
 
 
 # --------------------------------------------------------------------------
-# 6) 诊断测试（给桌面测试脚本调用，输出人类可读的逐步结果）
+# 6) 诊断测试（给测试台 lab / test 命令调用，输出人类可读的逐步结果）
 # --------------------------------------------------------------------------
 def _mask(text: str) -> str:
     if not text:
@@ -936,7 +980,7 @@ def _acquire_single_instance(name: str = "watch"):
         import msvcrt
     except ImportError:                 # 非 Windows，退化为不做限制
         return object()
-    lock_path = Path(__file__).with_name("logs") / ("%s.lock" % name)
+    lock_path = LOG_DIR / ("%s.lock" % name)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(lock_path, "a+")
@@ -975,7 +1019,7 @@ def _open_log(path: str | None, default_name: str = "srun-watch.log"):
     if not path:
         if sys.stdout is not None:
             return None
-        path = str(Path(__file__).with_name("logs") / default_name)
+        path = str(LOG_DIR / default_name)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.stat().st_size > 1_000_000:
@@ -1018,7 +1062,8 @@ def run_once(timeout: float = 180.0, interval: float = 2.0, log_path: str | None
              max_login_attempts: int = 3, nudge: bool = False, should_stop=None) -> int:
     """开机一次性登录：等网络就绪 -> 登录 -> 立刻退出。
 
-    不长驻、不重连。由开机自启（Windows 服务或计划任务）拉起来跑一次。
+    本函数自身不长驻、不重连（断线重连是 watch() 的职责，由 reconnect 开关启用）。
+    开机自启的 Windows 服务在「断线重连关闭」时跑的就是它。
     should_stop: 可选回调，返回 True 时立即退出（服务收到 SCM 停止请求时用）。
     返回 RC_OK / RC_FAIL / RC_SKIP。
     """
@@ -1103,8 +1148,24 @@ def run_once(timeout: float = 180.0, interval: float = 2.0, log_path: str | None
         time.sleep(interval)
 
 
-def watch(interval: int = 30, log_path: str | None = None) -> int:
-    """守护循环：只在「有线 + 校园网 + 未认证」时登录，其余情况安静跳过。"""
+def _sleep_stoppable(seconds: float, should_stop=None) -> bool:
+    """分片 sleep：每秒检查一次 should_stop，提前返回 True（服务停止时快速响应）。"""
+    deadline = time.monotonic() + max(0, seconds)
+    while True:
+        if should_stop is not None and should_stop():
+            return True
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            return False
+        time.sleep(min(1.0, remain))
+
+
+def watch(interval: int = 30, log_path: str | None = None, should_stop=None) -> int:
+    """守护循环：只在「网卡类型在登录模式内 + 校园网 + 未认证」时登录，其余安静跳过。
+
+    should_stop: 可选回调，返回 True 时退出循环（服务收到 SCM 停止请求、
+    或断线重连开关被关闭时用）。
+    """
     lock = _acquire_single_instance()
     if lock is None:
         print("[跳过] 已经有一个守护进程在运行了", flush=True)
@@ -1125,11 +1186,14 @@ def watch(interval: int = 30, log_path: str | None = None) -> int:
     emit("%s 守护启动（pid=%d），检测间隔 %d 秒" % (time.strftime("%F %T"), os.getpid(), interval))
     if log_fh is not None:
         emit("日志文件: %s" % log_fh.name)
-    emit("判定规则：出口必须是有线网卡，且 %s 确认是深澜门户，且当前未联网。" % PORTAL_HOST)
+    emit("判定规则：出口网卡需在登录模式内，且 %s 确认是深澜门户，且当前未联网。" % PORTAL_HOST)
 
     last_reason = None
     fails = 0
     while True:
+        if should_stop is not None and should_stop():
+            emit("%s [退出] 收到停止请求，守护结束。" % time.strftime("%F %T"))
+            return RC_OK
         try:
             env = check_environment()
             reason = env["reason"]
@@ -1139,7 +1203,8 @@ def watch(interval: int = 30, log_path: str | None = None) -> int:
                     emit("%s [跳过] %s" % (time.strftime("%F %T"), reason))
                     last_reason = reason
                 fails = 0
-                time.sleep(FAST_RETRY_SECONDS if env.get("fast_retry") else interval)
+                if _sleep_stoppable(FAST_RETRY_SECONDS if env.get("fast_retry") else interval, should_stop):
+                    continue
                 continue
 
             res = login()
@@ -1149,13 +1214,13 @@ def watch(interval: int = 30, log_path: str | None = None) -> int:
                     emit("%s [登录成功] ip=%s" % (time.strftime("%F %T"), env.get("source_ip")))
                     fails = 0
                     last_reason = None
-                    time.sleep(interval)
+                    _sleep_stoppable(interval, should_stop)
                 else:
                     fails += 1
                     last_reason = None
                     emit("%s [已提交但外网仍不通] ip=%s，%d 秒后重试"
                          % (time.strftime("%F %T"), env.get("source_ip"), min(60, 5 * fails)))
-                    time.sleep(min(60, 5 * fails))
+                    _sleep_stoppable(min(60, 5 * fails), should_stop)
             else:
                 fails += 1
                 last_reason = None
@@ -1165,14 +1230,14 @@ def watch(interval: int = 30, log_path: str | None = None) -> int:
                     resp.get("error_msg") or resp.get("suc_msg") or "",
                     min(60, 5 * fails),
                 ))
-                time.sleep(min(60, 5 * fails))
+                _sleep_stoppable(min(60, 5 * fails), should_stop)
         except ConfigError as exc:
             emit("%s [配置错误] %s" % (time.strftime("%F %T"), exc))
-            time.sleep(60)
+            _sleep_stoppable(60, should_stop)
         except Exception as exc:
             fails += 1
             emit("%s [异常] %s（%d 秒后重试）" % (time.strftime("%F %T"), exc, min(60, 5 * fails)))
-            time.sleep(min(60, 5 * fails))
+            _sleep_stoppable(min(60, 5 * fails), should_stop)
     return 0
 
 
@@ -1192,9 +1257,10 @@ def watch(interval: int = 30, log_path: str | None = None) -> int:
 SVC_NAME = "SRunAutoLogin"
 SVC_DISPLAY = "SRun 校园网自动登录（开机早期）"
 SVC_DESCRIPTION = (
-    "开机早期等待校园网就绪并自动完成深澜认证，认证结束即退出，不常驻、不重连。"
-    "与旧版计划任务方案等价，但由服务控制管理器(SCM)直接拉起，"
-    "触发时点远早于任务计划程序，可在用户登录前完成认证。"
+    "开机早期等待校园网就绪并自动完成深澜认证。默认认证结束即退出；"
+    "在配置里开启「断线自动重连」后服务常驻守护，掉线自动恢复。"
+    "由服务控制管理器(SCM)直接拉起，触发时点远早于任务计划程序，"
+    "可在用户登录前完成认证。"
 )
 
 SERVICE_WIN32_OWN_PROCESS = 0x00000010
@@ -1212,6 +1278,7 @@ SC_MANAGER_ALL_ACCESS = 0x000F003F
 SC_MANAGER_CONNECT = 0x0001
 SERVICE_QUERY_CONFIG = 0x0001
 SERVICE_QUERY_STATUS = 0x0004
+SERVICE_START_RIGHT = 0x0010
 SERVICE_STOP_RIGHT = 0x00000020
 SERVICE_DELETE_RIGHT = 0x00010000
 SERVICE_ALL_ACCESS = 0x000F01FF
@@ -1222,7 +1289,7 @@ ERROR_SERVICE_MARKED_FOR_DELETE = 1072
 SERVICE_CONFIG_DESCRIPTION = 0x00000001
 SERVICE_CONFIG_FAILURE_ACTIONS = 0x00000002
 SC_ACTION_RESTART = 0x00000001
-SVC_LOG_PATH = str(Path(__file__).with_name("logs") / "srun-svc.log")
+SVC_LOG_PATH = str(LOG_DIR / "srun-svc.log")
 
 
 class _SVC_STATUS(ctypes.Structure):
@@ -1357,8 +1424,14 @@ def _svc_main(argc, argv):
     # 业务（等网络 + 认证，最长 180 秒）在服务已运行的状态下慢慢做。
     _svc_report(SERVICE_RUNNING)
     try:
-        run_once(timeout=180.0, interval=2.0, log_path=SVC_LOG_PATH, nudge=True,
-                 should_stop=lambda: _svc_stop_requested)
+        if get_reconnect():
+            # 断线自动重连：常驻守护。每轮重读 config——开关被关闭
+            # （或收到 SCM 停止请求）时自动退出，配置改动实时生效。
+            watch(interval=30, log_path=SVC_LOG_PATH, should_stop=lambda: (
+                _svc_stop_requested or not get_reconnect()))
+        else:
+            run_once(timeout=180.0, interval=2.0, log_path=SVC_LOG_PATH, nudge=True,
+                     should_stop=lambda: _svc_stop_requested)
     except Exception:
         pass
     _svc_report(SERVICE_STOPPED)
@@ -1379,8 +1452,8 @@ def run_service() -> int:
         err = ctypes.get_last_error()
         if err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT:
             print("[提示] svc 子命令是给 Windows 服务控制管理器(SCM)调用的，不能手动运行。")
-            print("       手动跑一次认证: python srun_login.py once")
-            print("       安装服务      : python srun_login.py svc-install （需管理员）")
+            print("       手动跑一次认证: python src\\srun_login.py once")
+            print("       安装服务      : python src\\srun_login.py svc-install （需管理员）")
         else:
             print("[错误] StartServiceCtrlDispatcher 失败，错误码 %d" % err)
         return RC_FAIL
@@ -1521,7 +1594,7 @@ def svc_install() -> int:
         print("  下次开机：服务在网络栈就绪后约 2 秒内完成认证，")
         print("  目标是「输完密码进桌面时网络已经通了」。")
         print("  看日志：Get-Content '%s' -Tail 20 -Wait" % SVC_LOG_PATH)
-        print("  卸载：  pwsh -File uninstall_autostart.ps1")
+        print("  卸载：  双击『深澜服务管理.bat』选 2，或运行 python src\\srun_login.py svc-uninstall")
         return RC_OK
     finally:
         adv.CloseServiceHandle(hscm)
@@ -1569,6 +1642,50 @@ def svc_uninstall(drop_task: bool = True) -> int:
         adv.CloseServiceHandle(hscm)
 
 
+def svc_start() -> int:
+    """启动已安装但未运行的服务（需管理员；已运行则视为成功）。"""
+    adv = _svc_advapi()
+    hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+    if not hscm:
+        err = ctypes.get_last_error()
+        print("[错误] 打开服务控制管理器失败（错误码 %d）。请以管理员身份运行。" % err)
+        return RC_FAIL
+    try:
+        hsvc = adv.OpenServiceW(hscm, SVC_NAME, SERVICE_START_RIGHT | SERVICE_QUERY_STATUS)
+        if not hsvc:
+            err = ctypes.get_last_error()
+            if err == ERROR_SERVICE_DOES_NOT_EXIST:
+                print("[错误] 服务 %s 未安装，先安装再启动。" % SVC_NAME)
+            else:
+                print("[错误] 打开服务失败，错误码 %d" % err)
+            return RC_FAIL
+        try:
+            st = _SVC_STATUS()
+            adv.QueryServiceStatus(hsvc, ctypes.byref(st))
+            if st.dwCurrentState == SERVICE_RUNNING:
+                print("服务已在运行中。")
+                return RC_OK
+            if not adv.StartServiceW(hsvc, 0, None):
+                err = ctypes.get_last_error()
+                if err != ERROR_SERVICE_ALREADY_RUNNING:
+                    print("[错误] 启动服务失败，错误码 %d" % err)
+                    return RC_FAIL
+            for _ in range(20):               # 等待 RUNNING（进程冷启动 + ServiceMain）
+                adv.QueryServiceStatus(hsvc, ctypes.byref(st))
+                if st.dwCurrentState == SERVICE_RUNNING:
+                    print("服务已启动，进入运行状态。")
+                    return RC_OK
+                if st.dwCurrentState == SERVICE_STOPPED:
+                    break                     # 跑完即退（重连关闭模式）也是正常路径
+                time.sleep(0.5)
+            print("服务已启动（若断线重连为关闭模式，认证完成后会自动退出，属正常）。")
+            return RC_OK
+        finally:
+            adv.CloseServiceHandle(hsvc)
+    finally:
+        adv.CloseServiceHandle(hscm)
+
+
 def svc_status() -> int:
     """查看服务的安装 / 运行状态与最近日志。"""
     adv = _svc_advapi()
@@ -1602,6 +1719,9 @@ def svc_status() -> int:
                 print("  启动类型 : %s" % {2: "自动", 3: "手动", 4: "已禁用"}.get(
                     cfg.dwStartType, str(cfg.dwStartType)))
                 print("  执行     : %s" % (cfg.lpBinaryPathName or ""))
+            print("  配置模式 : 断线自动重连 %s" % (
+                "已开启（服务常驻守护，掉线自动恢复）" if get_reconnect()
+                else "已关闭（认证完成即退出）"))
             print("  日志     : %s" % SVC_LOG_PATH)
             log = Path(SVC_LOG_PATH)
             if log.is_file():
@@ -1618,6 +1738,156 @@ def svc_status() -> int:
 
 
 # --------------------------------------------------------------------------
+# 7.6) 桌面菜单入口：服务管理（service）与测试台（lab）
+#      对应根目录的『深澜服务管理.bat』『深澜测试.bat』
+# --------------------------------------------------------------------------
+def _pause() -> None:
+    try:
+        input("\n按回车键退出 ...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_elevated(script_args: str) -> bool:
+    """以管理员身份重新启动本脚本执行 script_args（弹 UAC，新窗口显示结果）。"""
+    params = '"%s" %s' % (Path(__file__).resolve(), script_args)
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, None, 1)   # 1 = SW_SHOWNORMAL
+        return rc > 32
+    except Exception:
+        return False
+
+
+def run_service_manager(do: str | None = None) -> int:
+    """『深澜服务管理.bat』：显示核心服务状态，菜单安装 / 卸载。"""
+    if do == "install":                    # 提权后的新窗口直接执行
+        rc = svc_install()
+        _pause()
+        return rc
+    if do == "uninstall":
+        rc = svc_uninstall()
+        _pause()
+        return rc
+    if do == "start":
+        rc = svc_start()
+        _pause()
+        return rc
+
+    while True:
+        print("")
+        print("=" * 62)
+        print("  服务管理")
+        print("=" * 62)
+        print("  本项目核心服务：开机早期自动完成校园网认证")
+        print("")
+        svc_status()                       # 状态（服务/启动类型/配置模式/最近日志）
+        print("")
+        print("  [1] 安装服务（开机自动运行，装完立即验证，无需重启）")
+        print("  [2] 卸载服务")
+        print("  [0] 退出（直接回车）")
+        try:
+            choice = input("  请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return RC_OK
+
+        if choice in ("", "0"):
+            return RC_OK
+        if choice not in ("1", "2"):
+            print("  无效选择：%s（请输入 0-2）" % choice)
+            continue
+
+        action = "install" if choice == "1" else "uninstall"
+        if _is_admin():
+            if choice == "1":
+                svc_install()
+            else:
+                svc_uninstall()
+            continue
+        print("")
+        print("  需要管理员权限，正在弹出 UAC（请点「是」）...")
+        print("  操作将在新的管理员窗口里执行并显示结果。")
+        if _relaunch_elevated("service --do " + action):
+            return 10                      # 10 = 已请求提权，结果在新的管理员窗口里
+        print("  [取消] 未提权，什么都没有做。")
+
+
+def run_lab() -> int:
+    """『深澜测试.bat』：显示当前判定，菜单登录 / 注销（均可安全重复执行）。"""
+    while True:
+        print("")
+        print("=" * 62)
+        print("  深澜测试台")
+        print("=" * 62)
+        try:
+            env = check_environment()
+            info = env.get("adapter") or {}
+            print("  出口网卡 : %s" % (_first_line(str(info.get("name", ""))) or "(未识别)"))
+            print("  本机地址 : %s" % (env.get("source_ip") or "(无路由)"))
+            print("  网卡类型 : %s" % (env.get("kind") or "unknown"))
+            print("  登录模式 : %s" % LOGIN_MODE_LABELS.get(
+                env.get("login_mode", "wired"), env.get("login_mode", "wired")))
+            print("  校园门户 : %s" % ("已确认" if env.get("campus") else "未确认"))
+            print("  外网状态 : %s" % ("在线" if env.get("online") else "离线"))
+            print("  当前判定 : %s" % env["reason"])
+        except Exception as exc:
+            print("  环境检测失败 : %s" % exc)
+        print("")
+        print("  [1] 登录测试（完整认证流程，已在线则直接提示，可重复执行）")
+        print("  [2] 注销会话（制造未认证状态，可重复执行）")
+        print("  [0] 退出（直接回车）")
+        try:
+            choice = input("  请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return RC_OK
+
+        if choice in ("", "0"):
+            return RC_OK
+
+        if choice == "1":
+            print("")
+            try:
+                if is_online():
+                    print("  当前已经联网，无需登录（重复执行不会出问题）。")
+                else:
+                    rc = run_diagnostic()
+                    if rc is None:
+                        print("  环境判定为「跳过」，未执行登录。")
+            except ConfigError as exc:
+                print("  [配置错误] %s" % exc)
+            except Exception as exc:
+                print("  [异常] %s" % exc)
+            continue
+
+        if choice == "2":
+            print("")
+            try:
+                res = logout()
+                resp = res.get("resp") or {}
+                if res.get("ok"):
+                    print("  [注销成功] %s" % (resp.get("error_msg") or "会话已注销"))
+                    time.sleep(2)
+                    print("  注销后外网状态: %s" % ("仍在线" if is_online() else "已离线"))
+                else:
+                    print("  [注销未生效] %s %s（本来就不在线时这是正常结果）" % (
+                        resp.get("error") or "", resp.get("error_msg") or ""))
+            except Exception as exc:
+                print("  [异常] %s" % exc)
+            continue
+
+        print("  无效选择：%s（请输入 0-2）" % choice)
+
+
+# --------------------------------------------------------------------------
 # 7) 配置编辑 / 迁移体检
 # --------------------------------------------------------------------------
 def _ask(label: str, current: str, secret: bool = False) -> str:
@@ -1630,72 +1900,161 @@ def _ask(label: str, current: str, secret: bool = False) -> str:
     return raw or current
 
 
+def _svc_current_state() -> str:
+    """服务当前状态：running / stopped / missing / transitioning / unknown（无需管理员）。"""
+    try:
+        adv = _svc_advapi()
+        hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+        if not hscm:
+            return "unknown"
+        try:
+            hsvc = adv.OpenServiceW(hscm, SVC_NAME, SERVICE_QUERY_STATUS)
+            if not hsvc:
+                return "missing"
+            try:
+                st = _SVC_STATUS()
+                adv.QueryServiceStatus(hsvc, ctypes.byref(st))
+                if st.dwCurrentState == SERVICE_RUNNING:
+                    return "running"
+                if st.dwCurrentState == SERVICE_STOPPED:
+                    return "stopped"
+                return "transitioning"
+            finally:
+                adv.CloseServiceHandle(hsvc)
+        finally:
+            adv.CloseServiceHandle(hscm)
+    except Exception:
+        return "unknown"
+
+
 def run_config_editor(log=print) -> int:
-    """交互式修改 username / password / ac_id / portal。"""
-    d = _read_config()
-    cur_user = str(d.get("username", USERNAME))
-    cur_pass = str(d.get("password", PASSWORD))
-    cur_ac = str(d.get("ac_id", AC_ID))
-    cur_portal = str(d.get("portal") or PORTAL)
+    """交互式配置菜单：账号密码 / 门户参数 / 登录模式 / 断线自动重连。"""
+    while True:
+        d = _read_config()
+        cur_user = str(d.get("username", USERNAME))
+        cur_pass = str(d.get("password", PASSWORD))
+        cur_ac = str(d.get("ac_id", AC_ID))
+        cur_portal = str(d.get("portal") or PORTAL)
+        cur_mode = get_login_mode()
+        cur_reconnect = get_reconnect()
 
-    log("=" * 62)
-    log("  修改校园网账号密码")
-    log("=" * 62)
-    log("  配置文件: %s" % config_path())
-    log("")
-    log("  当前用户名 : %s" % cur_user)
-    log("  当前密码   : %s  (长度 %d)" % (_mask(cur_pass), len(cur_pass)))
-    log("  当前 ac_id : %s" % cur_ac)
-    log("  当前门户   : %s" % cur_portal)
-    log("")
-    log("  直接按回车 = 保持原值不变")
-    log("")
-
-    user = _ask("用户名  ", cur_user)
-    pwd = _ask("密码    ", cur_pass, secret=True)
-    ac = _ask("ac_id  ", cur_ac)
-    portal = _ask("门户地址", cur_portal)
-
-    if not user.strip() or not pwd:
         log("")
-        log("[取消] 用户名和密码都不能为空，未做任何修改。")
-        return RC_FAIL
-
-    log("")
-    log("-" * 62)
-    log("  即将写入:")
-    log("    用户名 : %s" % user)
-    log("    密码   : %s  (长度 %d)" % (_mask(pwd), len(pwd)))
-    log("    ac_id  : %s" % ac)
-    log("    门户   : %s" % portal)
-    log("-" * 62)
-    try:
-        confirm = input("  确认写入? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        confirm = "n"
-    if confirm not in ("", "y", "yes"):
-        log("  已取消，未做任何修改。")
-        return RC_FAIL
-
-    cfg = write_config(user.strip(), pwd, ac.strip(), portal.strip())
-    log("")
-    log("  已写入 %s" % cfg)
-    log("  密码以明文保存；该文件已在 .gitignore 里，不会被提交。")
-    log("")
-    log("  提示: 计划任务是运行时才读这个文件，不需要重新安装。")
-    log("")
-
-    try:
-        go = input("  现在测试一次登录? [Y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        go = "n"
-    if go in ("", "y", "yes"):
+        log("=" * 62)
+        log("  深澜配置")
+        log("=" * 62)
+        log("  配置文件 : %s" % config_path())
         log("")
-        rc = run_diagnostic()
-        if rc is None:
+        log("  用户名     : %s" % cur_user)
+        log("  密码       : %s  (长度 %d)" % (_mask(cur_pass), len(cur_pass)))
+        log("  ac_id      : %s" % cur_ac)
+        log("  门户       : %s" % cur_portal)
+        log("  登录模式   : %s" % LOGIN_MODE_LABELS.get(cur_mode, cur_mode))
+        log("  断线重连   : %s" % ("已开启（服务常驻守护）" if cur_reconnect else "已关闭（认证完即退出）"))
+        log("")
+        log("  [1] 修改账号密码")
+        log("  [2] 修改门户参数（ac_id / 门户地址，换校区、换学校用）")
+        log("  [3] 修改登录模式（仅有线 / 仅无线 / 有线+无线）")
+        log("  [4] 断线自动重连（开启 = 掉线后自动恢复登录）")
+        log("  [0] 退出（直接回车）")
+        try:
+            choice = input("  请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             return RC_OK
-        return RC_OK if rc else RC_FAIL
-    return RC_OK
+
+        if choice in ("", "0"):
+            return RC_OK
+
+        if choice == "1":
+            log("")
+            log("  直接按回车 = 保持原值不变")
+            user = _ask("用户名  ", cur_user)
+            pwd = _ask("密码    ", cur_pass, secret=True)
+            if not user.strip() or not pwd:
+                log("  [取消] 用户名和密码都不能为空，未做任何修改。")
+                continue
+            log("  即将写入: 用户名 %s，密码 %s (长度 %d)" % (user, _mask(pwd), len(pwd)))
+            try:
+                confirm = input("  确认写入? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = "n"
+            if confirm not in ("", "y", "yes"):
+                log("  已取消，未做任何修改。")
+                continue
+            write_config(username=user.strip(), password=pwd)
+            log("  已写入。密码以明文保存（config.json 已在 .gitignore 里，不会被提交）。")
+            log("  服务运行时才读配置文件，改完立即生效，不需要重装。")
+            continue
+
+        if choice == "2":
+            log("")
+            log("  直接按回车 = 保持原值不变")
+            ac = _ask("ac_id  ", cur_ac)
+            portal = _ask("门户地址", cur_portal)
+            write_config(ac_id=ac.strip(), portal=portal.strip() or None)
+            log("  已写入。门户改动在下次登录时生效。")
+            continue
+
+        if choice == "3":
+            log("")
+            log("  [1] 仅有线    —— 只在有线出口时登录（默认）")
+            log("  [2] 仅无线    —— 只在无线出口时登录")
+            log("  [3] 有线+无线 —— 两种出口都自动登录")
+            try:
+                m = input("  请选择 [1-3，回车取消]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                m = ""
+            table = {"1": "wired", "2": "wifi", "3": "both"}
+            if m not in table:
+                log("  已取消，未做任何修改。")
+                continue
+            write_config(login_mode=table[m])
+            log("  登录模式已设为「%s」，立即生效。" % LOGIN_MODE_LABELS[table[m]])
+            continue
+
+        if choice == "4":
+            log("")
+            log("  断线自动重连：当前 %s" % ("已开启" if cur_reconnect else "已关闭"))
+            log("    开启 = 服务常驻守护，检测到掉线后自动重新登录（约 30 秒周期）")
+            log("    关闭 = 认证完成即退出，不占后台")
+            log("")
+            log("  [1] 开启   [2] 关闭   （回车取消）")
+            try:
+                m = input("  请选择: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                m = ""
+            if m == "1":
+                write_config(reconnect=True)
+                log("  已开启断线自动重连。")
+                state = _svc_current_state()
+                if state == "running":
+                    log("  服务正在运行：若已在守护中，30 秒内生效；")
+                    log("  若在开机认证阶段，完成后自动进入守护。")
+                elif state == "stopped":
+                    log("  服务当前未运行（上次按「关闭」模式跑完即退），")
+                    log("  正在以管理员权限启动它进入守护模式（弹 UAC，请点「是」）...")
+                    if _is_admin():
+                        svc_start()
+                    elif _relaunch_elevated("service --do start"):
+                        log("  已在新窗口启动，结果见该窗口。")
+                    else:
+                        log("  [取消] 未提权：服务将在下次开机自动进入守护模式。")
+                elif state == "missing":
+                    log("  [提示] 服务尚未安装：双击『深澜服务管理.bat』选 1 安装，")
+                    log("         安装后立即以守护模式运行。")
+                else:
+                    log("  服务状态异常（%s）：下次开机将自动进入守护模式。" % state)
+            elif m == "2":
+                write_config(reconnect=False)
+                log("  已关闭断线自动重连。")
+                if _svc_current_state() == "running":
+                    log("  若服务正在守护中，它会在 30 秒内检测到开关变化并自动退出，")
+                    log("  当前网络连接不受影响。")
+            else:
+                log("  已取消，未做任何修改。")
+            continue
+
+        log("  无效选择：%s（请输入 0-4）" % choice)
 
 
 def doctor(log=print) -> int:
@@ -1714,8 +2073,8 @@ def doctor(log=print) -> int:
 
     log("")
     log("[2] 关键文件")
-    for name in ("srun_login.py", "config.json"):
-        p = Path(__file__).with_name(name)
+    for name in ("src/srun_login.py", "config.json"):
+        p = PROJECT_ROOT / name
         ok = p.exists()
         log("      %-16s %s" % (name, "OK" if ok else "缺失"))
         if not ok:
@@ -1726,12 +2085,14 @@ def doctor(log=print) -> int:
     user, pwd, ac = load_config()
     if not pwd or pwd == PLACEHOLDER:
         log("      密码     : 未填写")
-        problems.append("config.json 里还没填密码（双击『配置账号密码.bat』）")
+        problems.append("config.json 里还没填密码（双击『深澜配置.bat』）")
     else:
         log("      用户名   : %s" % _mask(user))
         log("      密码     : %s (长度 %d)" % (_mask(pwd), len(pwd)))
     log("      ac_id    : %s" % ac)
     log("      门户     : %s" % PORTAL)
+    log("      登录模式 : %s" % LOGIN_MODE_LABELS.get(get_login_mode(), get_login_mode()))
+    log("      断线重连 : %s" % ("已开启（服务常驻守护）" if get_reconnect() else "已关闭（认证完即退出）"))
 
     log("")
     log("[4] 可选依赖（缺了也能跑）")
@@ -1752,7 +2113,7 @@ def doctor(log=print) -> int:
         problems.append("环境检测异常: %s" % exc)
 
     log("")
-    log("[6] 开机自启（服务优先，兼容旧计划任务）")
+    log("[6] 核心服务（含旧计划任务检查）")
     try:
         adv = _svc_advapi()
         hscm = adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
@@ -1785,7 +2146,7 @@ def doctor(log=print) -> int:
         log("      任务查询失败 : %s" % exc)
     try:
         if not _svc_service_installed():
-            log("      装它：双击『安装开机自启.bat』（需要管理员，推荐服务方式）")
+            log("      装它：双击『深澜服务管理.bat』选 1（需要管理员）")
     except Exception:
         pass
 
@@ -1841,10 +2202,15 @@ def main(argv: list[str] | None = None) -> int:
     sc.add_argument("username")
     sc.add_argument("password")
 
-    sub.add_parser("config", help="交互式修改账号密码（双击『配置账号密码.bat』）")
+    sub.add_parser("config", help="交互式配置：账号密码 / 门户参数 / 登录模式 / 断线重连（双击『深澜配置.bat』）")
     sub.add_parser("doctor", help="环境体检：换电脑/排障时先跑这个")
 
-    st = sub.add_parser("test", help="逐步诊断，跑一次完整认证测试（桌面脚本调用）")
+    ss = sub.add_parser("service", help="服务管理：显示核心服务状态，菜单安装/卸载（双击『深澜服务管理.bat』）")
+    ss.add_argument("--do", dest="do", choices=["install", "uninstall", "start"],
+                    help=argparse.SUPPRESS)   # 内部参数：提权窗口直接执行用
+    sub.add_parser("lab", help="测试台：显示判定，菜单登录/注销（双击『深澜测试.bat』）")
+
+    st = sub.add_parser("test", help="逐步诊断，跑一次完整认证测试（测试台 lab 调用的就是它）")
     st.add_argument("--username")
     st.add_argument("--password")
     st.add_argument("--ac-id", dest="ac_id")
@@ -1880,7 +2246,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "save":
-        cfg = Path(__file__).with_name("config.json")
+        cfg = config_path()
         cfg.write_text(
             json.dumps(
                 {"username": args.username, "password": args.password, "ac_id": AC_ID},
@@ -1893,6 +2259,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "config":
         return run_config_editor()
+
+    if args.cmd == "service":
+        return run_service_manager(args.do)
+    if args.cmd == "lab":
+        return run_lab()
 
     if args.cmd == "doctor":
         return doctor()
@@ -1912,6 +2283,8 @@ def main(argv: list[str] | None = None) -> int:
             print("出口网卡 : %s" % (_first_line(str(info.get("name", ""))) or "(未识别)"))
             print("本机地址 : %s" % (env.get("source_ip") or "(无路由)"))
             print("网卡类型 : %s" % (env.get("kind") or "unknown"))
+            print("登录模式 : %s" % LOGIN_MODE_LABELS.get(
+                env.get("login_mode", "wired"), env.get("login_mode", "wired")))
             print("校园门户 : %s" % ("已确认" if env.get("campus") else "未确认"))
             print("外网状态 : %s" % ("在线" if env.get("online") else "离线"))
             print("判定     : %s -> %s" % (env["action"], env["reason"]))
